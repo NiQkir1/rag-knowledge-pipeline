@@ -35,17 +35,22 @@ async def convert_document(
     output_format: str = Form("markdown"),
     max_file_mb: int = Form(50)
 ):
+    MAX_MB = 50
+    max_file_mb = max(1, min(max_file_mb, MAX_MB))
+    ALLOWED = {".pdf", ".docx", ".xlsx", ".png", ".jpg", ".jpeg"}
     # 1. Валидация
     if not file.content_type.startswith(("application/pdf", "application/vnd.openxmlformats", "image/", "text/html")):
         raise HTTPException(400, "Unsupported file type")
 
     # Читаем файл в память
-    content = await file.read()
+    content = await file.read(max_file_mb * 1024 * 1024 + 1)  # не читаем больше лимита
     if len(content) > max_file_mb * 1024 * 1024:
         raise HTTPException(400, f"File exceeds {max_file_mb}MB limit")
 
     # 2. Сохраняем во временный файл (Docling работает с файловыми путями)
-    ext = os.path.splitext(file.filename or ".pdf")[1]
+    ext = os.path.splitext(file.filename or ".pdf")[1].lower()
+    if ext not in ALLOWED:
+        raise HTTPException(400, "Unsupported file extension")
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
@@ -77,7 +82,7 @@ async def convert_document(
 
     except Exception as e:
         logger.error(f"Conversion failed: {e}", exc_info=True)
-        raise HTTPException(500, f"Processing error: {str(e)}")
+        raise HTTPException(500, "Processing error")
     finally:
         # 6. Чистим временный файл
         try:
@@ -92,4 +97,4 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     # workers=1: модели занимают много RAM, лучше масштабировать контейнеры
-    uvicorn.run(app, host="0.0.0.0", port=5001, workers=1)
+    uvicorn.run(app, host="127.0.0.1", port=5001, workers=1)

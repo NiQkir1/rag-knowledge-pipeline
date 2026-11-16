@@ -2,11 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using KnowledgeService.Security;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 namespace KnowledgeService.Controllers
 {
     [ApiController]
+    [Authorize]
     [Route("api/v1/[controller]")]
     public class KnowledgeController : ControllerBase
     {
@@ -19,16 +22,16 @@ namespace KnowledgeService.Controllers
         public IActionResult SearchKnowledgeBase(
             [FromQuery] string query,
             [FromQuery] string? category,
-            [FromQuery] int limit = 5,
-            [FromHeader(Name = "X-User-Roles")] string? userRolesHeader = "employee",
-            [FromHeader(Name = "X-Tenant-Id")] string? tenantId = "default")
+            [FromQuery] int limit = 5)
         {
+            // Роли и tenant берутся из проверенного JWT, а не из клиентских заголовков
+            var tenantId = User.TenantId();
             var sw = Stopwatch.StartNew();
             var traceId = Guid.NewGuid().ToString("N");
 
             // 1. Input Guardrail: Валидация запроса и защита от Prompt Injection
-            if (string.IsNullOrWhiteSpace(query))
-                return BadRequest(new { error = "Search query cannot be empty", trace_id = traceId });
+            if (string.IsNullOrWhiteSpace(query) || query.Length > 1000)
+                return BadRequest(new { error = "Search query must be 1..1000 chars", trace_id = traceId });
 
             var queryLower = query.ToLowerInvariant();
             if (DangerousPatterns.Any(p => queryLower.Contains(p)))
@@ -42,9 +45,7 @@ namespace KnowledgeService.Controllers
             }
 
             // 2. Document-Level ACL: Разграничение прав по ролям
-            var userRoles = (userRolesHeader ?? "employee")
-                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var userRoles = User.Roles();
 
             // 3. Симуляция гибридного поиска (Hybrid Search: Vector + BM25 с RRF)
             var candidates = new List<SearchResultCandidate>
@@ -75,7 +76,7 @@ namespace KnowledgeService.Controllers
 
             // Фильтрация по ACL
             var authorizedResults = candidates
-                .Where(c => c.AllowedRoles.Any(r => userRoles.Contains(r)) || userRoles.Contains("admin"))
+                .Where(c => c.AllowedRoles.Any(r => userRoles.Contains(r)))
                 .ToList();
 
             // 4. Переранжирование и оценка уверенности (Confidence Gate)
