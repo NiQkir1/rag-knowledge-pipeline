@@ -1,0 +1,32 @@
+# Visual Studio & .NET build output
+.vs/
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.dll
+*.pdb
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Docker volumes & local data
+pgdata/
+redpandadata/
+miniodata/
+data/
+*.log
+
+# OS & Editors
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
