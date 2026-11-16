@@ -1,4 +1,4 @@
-# Enterprise RAG Knowledge Base Pipeline
+# Enterprise Production RAG Knowledge Base Pipeline
 
 [![.NET 9](https://img.shields.io/badge/.NET-9.0-purple.svg)](https://dotnet.microsoft.com/)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
@@ -8,169 +8,141 @@
 [![MinIO](https://img.shields.io/badge/Storage-MinIO%20S3-c72c48.svg)](https://min.io/)
 [![Docker Compose](https://img.shields.io/badge/Deploy-Docker%20Compose-2496ED.svg)](https://docs.docker.com/compose/)
 
-Пайплайн построения доверенной корпоративной базы знаний для **RAG (Retrieval-Augmented Generation)** с обязательным циклом извлечения вопросов/ответов (Q&A) и **автономным сервисом верификации источника (Source Verification Service)**.
+Отказоустойчивый, масштабируемый и готовый к production пайплайн корпоративной базы знаний для **RAG (Retrieval-Augmented Generation)**. Включает семантический чанкинг, гибридный поиск, безопасность на уровне ролей (ACL), защиту от инъекций (Guardrails) и оценку качества ответов (RAGAS).
 
 ---
 
-## 💡 Решаемая проблема
-
-Классический RAG часто страдает от двух критических недостатков:
-1. **Фрагментация контекста:** текст нарезается на «слепые» чанки по 500 токенов, разрывая таблицы, списки и логические цепочки.
-2. **Галлюцинации LLM:** нет гарантии, что сгенерированный ответ опирается исключительно на факты из источника, а не додуман моделью.
-
-**Решение в этом проекте:**  
-Документы не просто нарезаются на чанки, а преобразуются в **структурированные фактологические пары «Вопрос — Ответ»** с категориями и подкатегориями. Каждый ответ проходит через **независимый «детектор лжи» (Source Verification Service)**, который по предложениям сверяет факты с оригиналом документа и присваивает статус доверия (`auto_approved`, `pending_review`, `rejected`).
-
----
-
-## 🏗 Архитектура системы
+## 🎯 Ключевые уровни Production-архитектуры
 
 ```mermaid
 flowchart TD
-    User["Пользователь / Внешняя система"] -->|Upload PDF, DOCX, XLSX, URL| Portal["Ingestion Portal\n(.NET 9 Web API)"]
-    Portal -->|S3 Upload| MinIO["MinIO S3 Storage\n(original & parsed.md)"]
-    Portal -->|Kafka: ingestion.requested| Redpanda["Redpanda / Kafka"]
-
-    Redpanda -->|ingestion.requested| DoclingSvc["Docling Parser Service\n(FastAPI + OCR)"]
-    DoclingSvc -->|Parsed Markdown & Chunks| PG["PostgreSQL 16 + pgvector\n(chunks + embeddings)"]
-
-    PG -->|Kafka: enrich.requested| EnrichmentWorker["Enrichment Worker\n(Ollama / Qwen2.5 / Llama 3)"]
-    EnrichmentWorker -->|Генерация категорий и Q&A| KBRecords["Таблица kb_records\n(status: pending_validation)"]
-
-    KBRecords -->|Kafka: verification.requested| VerificationSvc["Source Verification Service\n(FastAPI + Claim Evaluation)"]
-    
-    subgraph Verification ["Контур проверки источников"]
-        VerificationSvc -->|Сверка утверждений с чанками| GroundingEval["Расчёт Grounding Score\n(0.0 - 1.0)"]
-        GroundingEval -->|Score >= 0.85| Approved["auto_approved"]
-        GroundingEval -->|0.50 <= Score < 0.85| Review["pending_review"]
-        GroundingEval -->|Score < 0.50| Rejected["rejected"]
+    subgraph Ingestion ["1. Data Ingestion & Quality"]
+        Doc["Файл / URL / Текст"] --> Hash["SHA-256 Checksum\n(Дедупликация и версионирование)"]
+        Hash --> Sanitizer["Document Sanitizer\n(Защита от Indirect Prompt Injection)"]
+        Sanitizer --> SemChunk["Semantic Chunking\n(Без разрыва таблиц и кода)"]
+        SemChunk --> ParentChild["Parent-Child Linkage\n(Child: чанк, Parent: раздел)"]
     end
 
-    Approved --> RAG["RAG Search API\n(Доверенные ответы со ссылками)"]
+    subgraph Security ["2. Security & ACL"]
+        Req["Запрос пользователя"] --> InGuard["Input Guardrail\n(Фильтр Prompt Injection & токенов)"]
+        InGuard --> ACLFilter["Document-Level ACL\n(Фильтрация по ролям: employee / finance / admin)"]
+    end
+
+    subgraph Retrieval ["3. Retrieval & Reranking"]
+        ACLFilter --> Hybrid["Hybrid Search\n(Dense Vector + BM25 Full-Text)"]
+        Hybrid --> RRF["Reciprocal Rank Fusion (RRF)"]
+        RRF --> Reranker["Cross-Encoder Reranker"]
+        Reranker --> Gate{"Confidence Gate\n(Score >= 0.60?)"}
+        Gate -->|Нет| Fallback["Безопасный отказ /\nМаршрутизация на оператора"]
+        Gate -->|Да| Expand["Parent-Child Context Expansion"]
+    end
+
+    subgraph Verification ["4. Source Verification & Evaluation"]
+        Expand --> LLM["LLM Generation\n(Ollama / Qwen2.5 / Llama 3)"]
+        LLM --> Verifier["Source Verification Service\n(Пофактовая сверка с оригиналом)"]
+        Verifier --> Ragas["RAGAS Benchmarks\n(Faithfulness, Context Precision, Relevancy)"]
+    end
 ```
 
 ---
 
-## 🧩 Компоненты решения
+### 1. Качество данных и инжеста (Data Ingestion & Chunking)
+* **Интеллектуальный чанкинг (Semantic Chunking):** Реализован в `workers/processing_worker/semantic_chunker.py`. Учитывает разметку Markdown, заголовки, не разрывает таблицы (`| col | col |`) и изолирует блоки исходного кода (````...````).
+* **Parent-Child контекст:** Для векторного индекса генерируются компактные дочерние чанки (Child), но они хранят ссылку на родительский контекстный блок раздела (`parent_text`), чтобы LLM получала полную картину абзаца.
+* **Дедупликация и версионирование:** Документы хешируются по SHA-256. При обновлении источника старые векторные чанки помечаются `is_active = FALSE` или удаляются каскадно, предотвращая конфликты устаревших данных.
+* **Мультимодальный парсинг (Docling):** Сервис `workers/docling_service` извлекает структурированный текст и таблицы из PDF и офисных форматов.
 
-### 1. Ingestion Portal (`src/KnowledgeService`)
-* **Стек:** C#, ASP.NET Core (.NET 9), REST API, OpenAPI.
-* **Функции:**
-  * Приём и валидация входящих документов (до 50 MB) и веб-страниц по URL (`/api/v1/source/upload`, `/api/v1/source/url`).
-  * Трекинг жизненного цикла обработки задач (`jobs`): `queued -> parsing -> chunking -> indexing -> enriching -> validating -> completed`.
-  * Эндпоинты модерации для операторов (`/api/v1/review/records/{id}/approve` и `/reject`).
-  * RAG Search API (`/api/v1/knowledge/search`) с гибридным поиском.
+### 2. Точность поиска и извлечения (Retrieval Quality)
+* **Гибридный поиск (Hybrid Search):** Объединение плотного векторного поиска (Cosine Distance по pgvector) и лексического поиска (BM25 / `tsvector` с русским словарем) через **Reciprocal Rank Fusion (RRF)**:
+  $$RRF(d) = \sum_{m \in \{vec, bm25\}} \frac{1}{k + rank_m(d)}$$
+* **Переранжирование (Cross-Encoder Reranking):** Модуль переранжирования оценивает релевантность кандидатов под точные термины запроса и отсекает шум.
+* **Confidence Gate & Fallbacks:** Если итоговая уверенность поисковой выдачи ниже порога ($< 0.60$), система выдает безопасное предупреждение и передает запрос оператору поддержки, предотвращая генерацию галлюцинаций.
 
-### 2. Source Verification Service (`workers/verification_worker`)
-* **Стек:** Python 3.11, FastAPI, Pydantic, эвристический и NLP-анализ утверждений.
-* **Ключевой функционал:**
-  * **Два режима запуска:**
-    1. *Pipeline режим:* автоматическая сверка сразу после генерации Q&A через брокер сообщений.
-    2. *Standalone HTTP API (`POST /api/v1/verification/runs`):* возможность в любой момент перепроверить одну запись, конкретный источник или всю базу знаний целиком (например, при обновлении нормативной документации).
-  * **Пофактовый отчёт:** разбиение ответа на клеймы (`claims`), классификация каждого клейма (`supported`, `not_found`, `contradicted`), расчёт метрики `grounding_score` и сохранение трассировки доказательств (`evidence_spans`).
+### 3. Безопасность и контроль доступа (Security & Governance)
+* **Document-Level ACL (Контроль доступа на уровне документов):** В схеме БД `chunks`, `sources` и `kb_records` содержат массив `allowed_roles TEXT[]`. Поисковый запрос отфильтровывает чанки, к которым у пользователя нет допуска (например, сотрудник не увидит финансовые отчеты или секретные документы).
+* **Защита от Indirect Prompt Injection:** Все индексируемые документы проходят проверку на скрытые враждебные инструкции (`ignore previous instructions`, `system override`, инъекции скриптов) перед нарезкой и записью в векторную базу.
+* **Входные Guardrails:** Защита от джейлбрейков, инъекций и спама токенами на входе пользовательского API.
 
-### 3. Enrichment Worker (`workers/enrichment_worker`)
-* **Стек:** Python, Ollama API, JSON Schema.
-* **Функции:**
-  * Анализирует заголовок и оглавление источника для формирования иерархии категорий и подкатегорий.
-  * Батчами (по 3–5 чанков) генерирует целевые вопросы и фактологические ответы строго в рамках контекста.
-
-### 4. Docling Microservice (`workers/docling_service`)
-* **Стек:** FastAPI, Docling (IBM Granite OCR/Layout analysis).
-* **Функции:** Извлечение структурированного Markdown из сложных PDF с сохранением таблиц и метаданных.
+### 4. Наблюдаемость и оценка (Observability & Evaluation)
+* **Трассировка запросов (Query Traces):** Таблица `query_traces` сохраняет `trace_id`, `latency_ms`, `tokens_used`, использованный режим поиска и флаг срабатывания фолбэка.
+* **RAG Evaluation Framework:** Модуль `workers/evaluation/rag_evaluator.py` вычисляет ключевые метрики качества:
+  * **Faithfulness:** доля фактов ответа, подтвержденных контекстом.
+  * **Context Precision:** точность ранжирования чанков в поисковой выдаче.
+  * **Answer Relevancy:** смысловое соответствие ответа исходному вопросу.
 
 ---
 
-## 🗄 Модель данных (PostgreSQL + pgvector)
+## 🗄 Структура базы данных (`db/init.sql`)
 
-- **`jobs`**: полный статус выполнения пайплайна, счётчики сгенерированных и одобренных вопросов.
-- **`sources`**: метаданные источника, URI в S3, контрольная сумма (SHA-256) для дедупликации.
-- **`chunks`**: нарезка текста с векторными эмбеддингами `vector(1024)` для семантического поиска.
-- **`kb_records`**: готовые пары «Вопрос — Ответ», категория, подкатегория, статус модерации, `grounding_score` и JSON-отчёт проверки.
-- **`validation_runs`** & **`validation_run_items`**: аудит-лог всех прогонов верификации с детализацией по каждой записи.
+```sql
+-- Chunks: Семантические чанки с полнотекстовым поиском и ACL
+CREATE TABLE chunks (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    source_id UUID REFERENCES sources(id) ON DELETE CASCADE,
+    parent_text TEXT,                                            -- Parent-Child контекст
+    text TEXT NOT NULL,
+    search_vector tsvector GENERATED ALWAYS AS (to_tsvector('russian', text)) STORED, -- BM25
+    embedding vector(1024),                                      -- Векторное пространство
+    allowed_roles TEXT[] DEFAULT ARRAY['employee']::TEXT[]       -- Document-Level ACL
+);
+
+-- Query Traces: Наблюдаемость и аудит поиска
+CREATE TABLE query_traces (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    trace_id VARCHAR(64) NOT NULL,
+    query TEXT NOT NULL,
+    routed_to_fallback BOOLEAN DEFAULT FALSE,
+    latency_ms INT,
+    tokens_used INT
+);
+```
 
 ---
 
-## 🚀 Быстрый старт
+## 🚀 Быстрый запуск
 
-### 1. Поднятие инфраструктуры
-
-В корне проекта запустите Docker Compose:
+### 1. Запуск инфраструктуры (Docker Compose)
 
 ```bash
 docker compose up -d
 ```
 
-Поднимутся следующие сервисы:
-* **PostgreSQL 16 (pgvector):** `localhost:5432`
+Сервисы:
+* **PostgreSQL 16 + pgvector:** `localhost:5432`
 * **Redpanda (Kafka API):** `localhost:19092`
-* **Redpanda Web Console:** `http://localhost:8085`
-* **MinIO Storage & Console:** `http://localhost:9000` / `http://localhost:9001` (login: `minioadmin`, pass: `minioadminpassword`)
+* **Redpanda Console:** `http://localhost:8085`
+* **MinIO S3 Storage:** `http://localhost:9000` (Console: `:9001`)
 * **Redis:** `localhost:6379`
 
-### 2. Запуск C# Ingestion Portal
+### 2. Запуск .NET Ingestion Portal
 
 ```bash
 cd src/KnowledgeService
 dotnet run
 ```
 
-Swagger UI будет доступен по адресу `https://localhost:7001/openapi/v1.json` или через Visual Studio.
+Эндпоинт поиска с поддержкой ACL:
+```http
+GET /api/v1/knowledge/search?query=архитектура+пайплайна
+X-User-Roles: employee
+```
 
-### 3. Запуск Source Verification Service
+### 3. Тестирование качества поиска и Guardrails
 
 ```bash
-cd workers/verification_worker
-pip install fastapi uvicorn pydantic
-python app.py
+cd workers/retrieval_service
+python engine.py
 ```
 
-Сервис запустится на порту `http://localhost:8001`. Документация Swagger доступна по адресу `http://localhost:8001/docs`.
+### 4. Запуск бенчмарка метрик RAG (Evaluation)
 
----
-
-## 📡 Примеры API
-
-### Проверка ответа через Source Verification (Standalone)
-
-```http
-POST /api/v1/verification/verify-single
-Content-Type: application/json
-
-{
-  "record_id": "c9b2e04e-5a7a-4c27-9911-37f07cd75e01",
-  "question": "Какие типы кораблей поддерживаются в системе?",
-  "answer": "В игре есть 4 типа кораблей: линкор на 4 палубы, крейсеры, эсминцы и катера.",
-  "context_chunks": [
-    "В системе SeaBattle поддерживается 4 типа кораблей: 1 линкор (4 палубы), 2 крейсера (3 палубы), 3 эсминца (2 палубы) и 4 катера (1 палуба)."
-  ]
-}
-```
-
-**Ответ:**
-
-```json
-{
-  "record_id": "c9b2e04e-5a7a-4c27-9911-37f07cd75e01",
-  "grounded": true,
-  "grounding_score": 0.95,
-  "status": "auto_approved",
-  "claims": [
-    {
-      "claim": "В игре есть 4 типа кораблей: линкор на 4 палубы, крейсеры, эсминцы и катера",
-      "status": "supported",
-      "overlap_ratio": 0.88
-    }
-  ],
-  "contradictions": [],
-  "evidence_spans": [
-    "В системе SeaBattle поддерживается 4 типа кораблей: 1 линкор (4 палубы)..."
-  ]
-}
+```bash
+cd workers/evaluation
+python rag_evaluator.py
 ```
 
 ---
 
 ## 📄 Лицензия
 
-Проект распространяется под лицензией MIT.
+MIT License.
