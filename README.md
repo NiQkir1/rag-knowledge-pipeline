@@ -1,4 +1,4 @@
-# Enterprise Production RAG Knowledge Base Pipeline
+# Enterprise Production Event-Driven RAG Knowledge Pipeline
 
 [![.NET 9](https://img.shields.io/badge/.NET-9.0-purple.svg)](https://dotnet.microsoft.com/)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
@@ -8,137 +8,116 @@
 [![MinIO](https://img.shields.io/badge/Storage-MinIO%20S3-c72c48.svg)](https://min.io/)
 [![Docker Compose](https://img.shields.io/badge/Deploy-Docker%20Compose-2496ED.svg)](https://docs.docker.com/compose/)
 
-Отказоустойчивый, масштабируемый и готовый к production пайплайн корпоративной базы знаний для **RAG (Retrieval-Augmented Generation)**. Включает семантический чанкинг, гибридный поиск, безопасность на уровне ролей (ACL), защиту от инъекций (Guardrails) и оценку качества ответов (RAGAS).
+Отказоустойчивый промышленный RAG-пайплайн на базе **распределенной событийной архитектуры (Event-Driven Architecture)** с разделением на два независимых контура:
+1. **Асинхронный контур инжеста (ETL Pipeline):** очередь задач с DLQ, детерминированные `chunk_id` (UUID v5) для 100% идемпотентности, семантический чанкинг без разрыва таблиц и дедупликация по SHA-256.
+2. **Синхронный контур ретривала (Retrieval & Generation):** гибридный поиск (BM25 + Dense Vector), слияние кандидатов через Reciprocal Rank Fusion (RRF), Cross-Encoder реранжирование (топ-3..5 для устранения эффекта *Lost in the Middle*), Circuit Breaker и трассировка в формате Langfuse.
 
 ---
 
-## 🎯 Ключевые уровни Production-архитектуры
+## 🏛 Общая схема архитектуры (High-Level Architecture)
 
-```mermaid
-flowchart TD
-    subgraph Ingestion ["1. Data Ingestion & Quality"]
-        Doc["Файл / URL / Текст"] --> Hash["SHA-256 Checksum\n(Дедупликация и версионирование)"]
-        Hash --> Sanitizer["Document Sanitizer\n(Защита от Indirect Prompt Injection)"]
-        Sanitizer --> SemChunk["Semantic Chunking\n(Без разрыва таблиц и кода)"]
-        SemChunk --> ParentChild["Parent-Child Linkage\n(Child: чанк, Parent: раздел)"]
-    end
-
-    subgraph Security ["2. Security & ACL"]
-        Req["Запрос пользователя"] --> InGuard["Input Guardrail\n(Фильтр Prompt Injection & токенов)"]
-        InGuard --> ACLFilter["Document-Level ACL\n(Фильтрация по ролям: employee / finance / admin)"]
-    end
-
-    subgraph Retrieval ["3. Retrieval & Reranking"]
-        ACLFilter --> Hybrid["Hybrid Search\n(Dense Vector + BM25 Full-Text)"]
-        Hybrid --> RRF["Reciprocal Rank Fusion (RRF)"]
-        RRF --> Reranker["Cross-Encoder Reranker"]
-        Reranker --> Gate{"Confidence Gate\n(Score >= 0.60?)"}
-        Gate -->|Нет| Fallback["Безопасный отказ /\nМаршрутизация на оператора"]
-        Gate -->|Да| Expand["Parent-Child Context Expansion"]
-    end
-
-    subgraph Verification ["4. Source Verification & Evaluation"]
-        Expand --> LLM["LLM Generation\n(Ollama / Qwen2.5 / Llama 3)"]
-        LLM --> Verifier["Source Verification Service\n(Пофактовая сверка с оригиналом)"]
-        Verifier --> Ragas["RAGAS Benchmarks\n(Faithfulness, Context Precision, Relevancy)"]
-    end
+```
+[ Источники данных (PDF, Web, Excel) ] ──► [ Message Broker (Redpanda / Kafka / RabbitMQ) ]
+                                                   │
+                                                   ▼
+                                 [ Ingestion Workers (Event-Driven ETL) ]
+                                 ├── 1. Дедупликация (SHA-256) & Защита от Injection
+                                 ├── 2. Semantic Chunking (без разрыва таблиц и кода)
+                                 ├── 3. Детерминированные chunk_id (UUID v5, Idempotent)
+                                 ├── 4. Dead Letter Queue (DLQ) при исчерпании retry
+                                 └── 5. Запись в Vector DB (pgvector) + S3 (MinIO)
+                                                   │
+                                                   ▼
+[ Клиент / API Gateway ] ──────────────► [ Retrieval & Generation Service ]
+                                         ├── 1. Input Guardrails (санитайзинг запроса)
+                                         ├── 2. Document-Level ACL (фильтрация по ролям)
+                                         ├── 3. Hybrid Search: BM25 + Vector (топ-50)
+                                         ├── 4. RRF (Reciprocal Rank Fusion)
+                                         ├── 5. Cross-Encoder Reranking (топ-3..5)
+                                         ├── 6. Circuit Breaker (защита от сбоев LLM)
+                                         └── 7. Langfuse Tracing (латентность, спаны, токены)
 ```
 
 ---
 
-### 1. Качество данных и инжеста (Data Ingestion & Chunking)
-* **Интеллектуальный чанкинг (Semantic Chunking):** Реализован в `workers/processing_worker/semantic_chunker.py`. Учитывает разметку Markdown, заголовки, не разрывает таблицы (`| col | col |`) и изолирует блоки исходного кода (````...````).
-* **Parent-Child контекст:** Для векторного индекса генерируются компактные дочерние чанки (Child), но они хранят ссылку на родительский контекстный блок раздела (`parent_text`), чтобы LLM получала полную картину абзаца.
-* **Дедупликация и версионирование:** Документы хешируются по SHA-256. При обновлении источника старые векторные чанки помечаются `is_active = FALSE` или удаляются каскадно, предотвращая конфликты устаревших данных.
-* **Мультимодальный парсинг (Docling):** Сервис `workers/docling_service` извлекает структурированный текст и таблицы из PDF и офисных форматов.
+## ⚙️ Компоненты отказоустойчивого конвейера
 
-### 2. Точность поиска и извлечения (Retrieval Quality)
-* **Гибридный поиск (Hybrid Search):** Объединение плотного векторного поиска (Cosine Distance по pgvector) и лексического поиска (BM25 / `tsvector` с русским словарем) через **Reciprocal Rank Fusion (RRF)**:
-  $$RRF(d) = \sum_{m \in \{vec, bm25\}} \frac{1}{k + rank_m(d)}$$
-* **Переранжирование (Cross-Encoder Reranking):** Модуль переранжирования оценивает релевантность кандидатов под точные термины запроса и отсекает шум.
-* **Confidence Gate & Fallbacks:** Если итоговая уверенность поисковой выдачи ниже порога ($< 0.60$), система выдает безопасное предупреждение и передает запрос оператору поддержки, предотвращая генерацию галлюцинаций.
+### А. Асинхронный инжест (Ingestion & ETL Pipeline)
 
-### 3. Безопасность и контроль доступа (Security & Governance)
-* **Document-Level ACL (Контроль доступа на уровне документов):** В схеме БД `chunks`, `sources` и `kb_records` содержат массив `allowed_roles TEXT[]`. Поисковый запрос отфильтровывает чанки, к которым у пользователя нет допуска (например, сотрудник не увидит финансовые отчеты или секретные документы).
-* **Защита от Indirect Prompt Injection:** Все индексируемые документы проходят проверку на скрытые враждебные инструкции (`ignore previous instructions`, `system override`, инъекции скриптов) перед нарезкой и записью в векторную базу.
-* **Входные Guardrails:** Защита от джейлбрейков, инъекций и спама токенами на входе пользовательского API.
+Обработка тяжелых документов никогда не блокирует HTTP-потоки клиентов:
+* **Брокер сообщений и Dead Letter Queue (DLQ):** Документы публикуются в топик `ingestion.requested`. При недоступности сервисов эмбеддингов задача повторяется до 3 раз с экспоненциальным backoff. При фатальном сбое сообщение автоматически маршрутизируется в `ingestion.dlq` для аудита без падения системы.
+* **Детерминированные `chunk_id` (100% Idempotency):**
+  Каждый чанк получает детерминированный идентификатор через `UUID v5`:
+  $$\text{chunk\_id} = \text{UUIDv5}(\text{NAMESPACE}, \text{source\_id} + \text{chunk\_index} + \text{content\_hash})$$
+  Повторный запуск инжеста того же документа выполняет корректный **UPSERT** в векторной базе вместо раздувания дубликатов.
+* **Машина состояний метаданных:** Отслеживание статусов: `pending -> processing -> indexed -> failed`.
 
-### 4. Наблюдаемость и оценка (Observability & Evaluation)
-* **Трассировка запросов (Query Traces):** Таблица `query_traces` сохраняет `trace_id`, `latency_ms`, `tokens_used`, использованный режим поиска и флаг срабатывания фолбэка.
-* **RAG Evaluation Framework:** Модуль `workers/evaluation/rag_evaluator.py` вычисляет ключевые метрики качества:
-  * **Faithfulness:** доля фактов ответа, подтвержденных контекстом.
-  * **Context Precision:** точность ранжирования чанков в поисковой выдаче.
-  * **Answer Relevancy:** смысловое соответствие ответа исходному вопросу.
+### Б. Ретривал с гибридным поиском (Hybrid Search)
+
+Устраняет «слепоту» векторного поиска на точных артикулах, ГОСТах и серийных номерах:
+1. **Dense Retrieval (Vector Search):** поиск по смыслу через `pgvector` (косинусное расстояние по эмбеддингам).
+2. **Sparse Retrieval (BM25 / Full-Text):** точный поиск по лексическим совпадениям через PostgreSQL `tsvector` с русским словарем.
+3. **Reciprocal Rank Fusion (RRF):** Объединение двух списков кандидатов:
+   $$RRF(d) = \sum_{m \in \{vec, bm25\}} \frac{1}{60 + rank_m(d)}$$
+   Формируется сбалансированный пул из топ-50 кандидатов.
+
+### В. Переранжирование (Cross-Encoder Reranking)
+
+Отправка всех 50 чанков в LLM приводит к эффекту **Lost in the Middle** (потеря фактов в середине контекста) и перерасходу токенов.
+* Кросс-энкодер одновременно анализирует пару `[Запрос + Чанк]`.
+* Пул сужается с топ-50 до **топ-3..5 абсолютно релевантных чанков**.
+* В модель передается расширенное окно `parent_text` (Parent-Child Context Expansion).
 
 ---
 
-## 🗄 Структура базы данных (`db/init.sql`)
+## 🛡 Отказоустойчивость и безопасность (Resilience & Security)
 
-```sql
--- Chunks: Семантические чанки с полнотекстовым поиском и ACL
-CREATE TABLE chunks (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    source_id UUID REFERENCES sources(id) ON DELETE CASCADE,
-    parent_text TEXT,                                            -- Parent-Child контекст
-    text TEXT NOT NULL,
-    search_vector tsvector GENERATED ALWAYS AS (to_tsvector('russian', text)) STORED, -- BM25
-    embedding vector(1024),                                      -- Векторное пространство
-    allowed_roles TEXT[] DEFAULT ARRAY['employee']::TEXT[]       -- Document-Level ACL
-);
-
--- Query Traces: Наблюдаемость и аудит поиска
-CREATE TABLE query_traces (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    trace_id VARCHAR(64) NOT NULL,
-    query TEXT NOT NULL,
-    routed_to_fallback BOOLEAN DEFAULT FALSE,
-    latency_ms INT,
-    tokens_used INT
-);
-```
+1. **Circuit Breakers на внешние API (`workers/common/circuit_breaker.py`):**
+   * Предотвращает каскадный сбой системы при таймаутах или ошибках 5xx у внешних LLM-провайдеров.
+   * Состояния: `CLOSED` $\to$ `OPEN` $\to$ `HALF_OPEN`.
+   * При размыкании контура трафик мгновенно переключается на локальную резервную модель (Ollama) без ожидания таймаутов.
+2. **Document-Level ACL (Контроль доступа):**
+   * Разграничение прав по ролям (`employee`, `management`, `finance`, `admin`) на уровне векторной выборки.
+   * Сотрудник без прав никогда не увидит финансовые отчеты в поисковой выдаче.
+3. **Защита от Prompt Injection:**
+   * *Входные Guardrails:* фильтрация джейлбрейков (`ignore previous instructions`, `system override`).
+   * *Санитайзинг базы знаний:* выявление и экранирование Indirect Prompt Injection внутри загружаемых PDF/Word файлов.
+4. **Наблюдаемость (Langfuse / OpenTelemetry Tracing):**
+   * Сквозное логирование `trace_id`, латентности по спанам (`guardrail`, `hybrid_search`, `rerank`, `llm`), подсчет токенов и аудит фолбэков.
 
 ---
 
 ## 🚀 Быстрый запуск
 
-### 1. Запуск инфраструктуры (Docker Compose)
+### 1. Поднятие инфраструктуры
 
 ```bash
 docker compose up -d
 ```
 
-Сервисы:
-* **PostgreSQL 16 + pgvector:** `localhost:5432`
-* **Redpanda (Kafka API):** `localhost:19092`
-* **Redpanda Console:** `http://localhost:8085`
-* **MinIO S3 Storage:** `http://localhost:9000` (Console: `:9001`)
-* **Redis:** `localhost:6379`
+### 2. Тестирование асинхронного идемпотентного инжеста (ETL)
 
-### 2. Запуск .NET Ingestion Portal
+```bash
+python workers/processing_worker/async_ingest_worker.py
+```
+
+### 3. Тестирование Hybrid Search + Rerank + Langfuse Tracing
+
+```bash
+python workers/retrieval_service/engine.py
+```
+
+### 4. Тестирование Circuit Breaker
+
+```bash
+python workers/common/circuit_breaker.py
+```
+
+### 5. Запуск C# Ingestion Portal (.NET 9)
 
 ```bash
 cd src/KnowledgeService
 dotnet run
-```
-
-Эндпоинт поиска с поддержкой ACL:
-```http
-GET /api/v1/knowledge/search?query=архитектура+пайплайна
-X-User-Roles: employee
-```
-
-### 3. Тестирование качества поиска и Guardrails
-
-```bash
-cd workers/retrieval_service
-python engine.py
-```
-
-### 4. Запуск бенчмарка метрик RAG (Evaluation)
-
-```bash
-cd workers/evaluation
-python rag_evaluator.py
 ```
 
 ---
